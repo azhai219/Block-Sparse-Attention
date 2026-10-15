@@ -1,7 +1,27 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_blocksparse_attn_interface.py
 
-import block_sparse_attn_cuda
+import os
+
 import torch
+
+# On Linux, custom PyTorch extensions may fail to resolve libc10/torch libraries
+# unless the torch lib directory is placed on LD_LIBRARY_PATH before import.
+torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+ld_paths = ld_library_path.split(":") if ld_library_path else []
+if torch_lib_dir not in ld_paths:
+    os.environ["LD_LIBRARY_PATH"] = torch_lib_dir + (":" + ld_library_path if ld_library_path else "")
+
+try:
+    import block_sparse_attn_cuda
+except ImportError:
+    block_sparse_attn_cuda = None
+
+try:
+    import block_sparse_attn_cpu
+except ImportError:
+    block_sparse_attn_cpu = None
+
 import torch.nn as nn
 from typing import Optional, Tuple
 
@@ -165,6 +185,8 @@ def _block_sparse_attn_forward(
     window_size_left: int,
     window_size_right: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if block_sparse_attn_cuda is None:
+        raise RuntimeError("CUDA block sparse attention extension is not available.")
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = block_sparse_attn_cuda.fwd_block(
         q, k, v,
@@ -258,6 +280,8 @@ def _block_sparse_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if block_sparse_attn_cuda is None:
+        raise RuntimeError("CUDA block sparse attention extension is not available.")
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     dq, dk, dv, softmax_d = block_sparse_attn_cuda.bwd_block(
         dout,
@@ -462,6 +486,39 @@ def block_sparse_attn_func(
     exact_streaming=False,
     return_attn_probs=False,
 ):
+    if q.device.type == "cpu":
+        if block_sparse_attn_cpu is None:
+            raise RuntimeError("CPU block sparse attention extension is not available.")
+        if is_causal:
+            raise NotImplementedError("CPU block sparse attention does not support causal mode.")
+        if exact_streaming:
+            raise NotImplementedError("CPU block sparse attention does not support streaming mode.")
+        if base_blockmask is None:
+            raise ValueError("base_blockmask is required for CPU block sparse attention.")
+        if head_mask_type is None:
+            raise ValueError("head_mask_type is required for CPU block sparse attention.")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_mask_type = head_mask_type.to(torch.int32)
+        if (head_mask_type <= 0).any():
+            raise NotImplementedError("CPU block sparse attention only supports mask_type > 0; dense and streaming masks are not implemented.")
+        out = block_sparse_attn_cpu.forward(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            cu_seqlens_q.contiguous(),
+            cu_seqlens_k.contiguous(),
+            head_mask_type.contiguous(),
+            base_blockmask.contiguous(),
+            int(max_seqlen_q_),
+            int(max_seqlen_k_),
+            float(p_dropout),
+            float(softmax_scale),
+        )
+        if return_attn_probs:
+            return out, torch.empty((0,), device=q.device, dtype=q.dtype), torch.empty((0,), device=q.device, dtype=q.dtype)
+        return out
+
     head_mask_type, blocksparse_head_num = replace_ones_with_count(head_mask_type)
     if base_blockmask is not None:
         assert base_blockmask.shape[1] == blocksparse_head_num

@@ -122,6 +122,66 @@ The figures above illustrate the speedup gained by using Block Sparse Attention 
 
 The graph above demonstrates the performance of our kernel for this specified workload. For token-level streaming masks, we allocate 64 sink tokens and 256 local tokens. For block-level streaming masks, we allocate 1 sink block and 3 local blocks, with each block consisting of 128 tokens. Speedup results were measured on an A100 GPU, using dense FlashAttention2 as the baseline, with a head dimension of 128, 32 attention heads, and a batch size of 1.
 
+## Build and Usage
+
+### CPU-only build for the minimal block-sparse path
+
+This repository is originally a CUDA implementation. For a CPU-only environment, you can build the minimal `mask_type = 1` block-sparse extension without compiling the CUDA kernels.
+
+```bash
+cd /path/to/Block-Sparse-Attention
+BLOCK_SPARSE_ATTN_SKIP_CUDA_BUILD=TRUE python setup.py install
+```
+
+This keeps the CUDA path intact while compiling only the custom C++ CPU extension used for the block-sparse forward pass on CPU.
+
+### Python usage
+
+The Python API is exposed from `block_sparse_attn.block_sparse_attn_func`.
+
+```python
+import torch
+from block_sparse_attn import block_sparse_attn_func
+
+q = torch.randn(2, 1, 4, dtype=torch.float32)
+k = torch.randn(2, 1, 4, dtype=torch.float32)
+v = torch.randn(2, 1, 4, dtype=torch.float32)
+
+cu_seqlens_q = torch.tensor([0, 2], dtype=torch.int32)
+cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
+head_mask_type = torch.tensor([1], dtype=torch.int32)
+base_blockmask = torch.tensor([[[[True]]]], dtype=torch.bool)
+
+out = block_sparse_attn_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    head_mask_type,
+    streaming_info=None,
+    base_blockmask=base_blockmask,
+    max_seqlen_q_=2,
+    max_seqlen_k_=2,
+    p_dropout=0.0,
+    deterministic=False,
+    softmax_scale=1.0,
+    is_causal=False,
+    exact_streaming=False,
+    return_attn_probs=False,
+)
+
+print(out)
+```
+
+Notes:
+
+- On CPU, only `mask_type > 0` is supported in the minimal backend.
+- `mask_type = 1` corresponds to block-sparse attention and uses `base_blockmask`.
+- Dense attention (`mask_type = 0`) and streaming attention (`mask_type = -1`) are intentionally not implemented in the CPU path for this minimal build.
+
+### Standard install
+
 ## Installation
 
 Requirements:

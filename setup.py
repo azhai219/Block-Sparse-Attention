@@ -149,6 +149,22 @@ def append_nvcc_threads(nvcc_extra_args):
 cmdclass = {}
 ext_modules = []
 
+ext_modules.append(
+    CppExtension(
+        name="block_sparse_attn_cpu",
+        sources=[
+            "csrc/block_sparse_attn/src_cpu/cpu_block_sparse_attn.cpp",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+        },
+        include_dirs=[
+            Path(this_dir) / "csrc" / "block_sparse_attn",
+            Path(this_dir) / "csrc" / "block_sparse_attn" / "src_cpu",
+        ],
+    )
+)
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
