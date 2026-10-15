@@ -12,6 +12,100 @@ inline int64_t round_up(int64_t x, int64_t m) {
     return ((x + m - 1) / m) * m;
 }
 
+torch::Tensor block_sparse_row_softmax(
+    const torch::Tensor& logits,
+    const float softmax_scale) {
+    auto scaled_logits = logits * static_cast<double>(softmax_scale);
+    return torch::softmax(scaled_logits, /*dim=*/1);
+}
+
+template <typename scalar_t>
+void apply_single_head_block_sparse_attention(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& base_blockmask,
+    const int64_t sample_index,
+    const int64_t head_index,
+    const int64_t mask_index,
+    const int64_t q_start,
+    const int64_t q_end,
+    const int64_t k_start,
+    const int64_t k_end,
+    const float softmax_scale,
+    torch::Tensor& out) {
+    const int64_t block_m = 128;
+    const int64_t block_n = 128;
+    const int64_t q_len = q_end - q_start;
+    const int64_t k_len = k_end - k_start;
+
+    const auto sample_mask = base_blockmask.select(0, sample_index).select(0, mask_index);
+    const int64_t nrow_blocks = sample_mask.size(0);
+
+    auto q_head = q.slice(0, q_start, q_end).select(1, head_index);
+    auto k_head = k.slice(0, k_start, k_end).select(1, head_index);
+    auto v_head = v.slice(0, k_start, k_end).select(1, head_index);
+
+    for (int64_t row_block = 0; row_block < nrow_blocks; ++row_block) {
+        const int64_t q_block_start = row_block * block_m;
+        const int64_t q_block_end = std::min(q_block_start + block_m, q_len);
+        if (q_block_start >= q_len) {
+            continue;
+        }
+
+        const int64_t q_block_len = q_block_end - q_block_start;
+        std::vector<int64_t> valid_col_blocks;
+        valid_col_blocks.reserve(nrow_blocks);
+
+        for (int64_t col_block = 0; col_block < sample_mask.size(1); ++col_block) {
+            if (sample_mask[row_block][col_block].item<bool>()) {
+                valid_col_blocks.push_back(col_block);
+            }
+        }
+
+        if (valid_col_blocks.empty()) {
+            out.slice(0, q_start + q_block_start, q_start + q_block_end)
+                .select(1, head_index)
+                .zero_();
+            continue;
+        }
+
+        std::vector<torch::Tensor> valid_k_blocks;
+        std::vector<torch::Tensor> valid_v_blocks;
+        valid_k_blocks.reserve(valid_col_blocks.size());
+        valid_v_blocks.reserve(valid_col_blocks.size());
+
+        for (const int64_t col_block : valid_col_blocks) {
+            const int64_t k_block_start = col_block * block_n;
+            const int64_t k_block_end = std::min(k_block_start + block_n, k_len);
+            if (k_block_start >= k_len) {
+                continue;
+            }
+
+            valid_k_blocks.push_back(k_head.slice(0, k_block_start, k_block_end).contiguous());
+            valid_v_blocks.push_back(v_head.slice(0, k_block_start, k_block_end).contiguous());
+        }
+
+        if (valid_k_blocks.empty()) {
+            out.slice(0, q_start + q_block_start, q_start + q_block_end)
+                .select(1, head_index)
+                .zero_();
+            continue;
+        }
+
+        auto q_block = q_head.slice(0, q_block_start, q_block_end);
+        auto k_valid = torch::cat(valid_k_blocks, /*dim=*/0);
+        auto v_valid = torch::cat(valid_v_blocks, /*dim=*/0);
+        auto logits = torch::matmul(q_block, k_valid.transpose(0, 1));
+        auto probs = block_sparse_row_softmax(logits, softmax_scale);
+        auto out_block = torch::matmul(probs, v_valid);
+
+        out.slice(0, q_start + q_block_start, q_start + q_block_end)
+            .select(1, head_index)
+            .copy_(out_block);
+    }
+}
+
 template <typename scalar_t>
 void block_sparse_attention_cpu_impl(
     const torch::Tensor& q,
@@ -25,23 +119,21 @@ void block_sparse_attention_cpu_impl(
     const int64_t max_seqlen_k,
     const float softmax_scale,
     torch::Tensor& out) {
-    const int64_t batch_size = cu_seqlens_q.size(0) - 1;
+    // A logical sample is a packed segment [q_start, q_end) / [k_start, k_end) in the flattened tensor.
+    // Reading the implementation as a pipeline makes it easier to see the intent:
+    //   1) choose the sample slice from cu_seqlens,
+    //   2) select the head-specific block mask,
+    //   3) build the valid-key mask,
+    //   4) compute logits and softmax,
+    //   5) aggregate V with the attention weights.
+    const int64_t num_samples = cu_seqlens_q.size(0) - 1;
     const int64_t num_heads = q.size(1);
-    const int64_t head_dim = q.size(2);
-    const int64_t block_m = 128;
-    const int64_t block_n = 128;
 
-    auto q_acc = q.accessor<scalar_t, 3>();
-    auto k_acc = k.accessor<scalar_t, 3>();
-    auto v_acc = v.accessor<scalar_t, 3>();
-    auto out_acc = out.accessor<scalar_t, 3>();
     auto cuq_acc = cu_seqlens_q.accessor<int32_t, 1>();
     auto cuk_acc = cu_seqlens_k.accessor<int32_t, 1>();
     auto head_mask_acc = head_mask_type.accessor<int32_t, 1>();
-    auto blockmask_bool = base_blockmask.to(torch::kBool).contiguous();
-    auto blockmask_acc = blockmask_bool.accessor<bool, 4>();
 
-    for (int64_t b = 0; b < batch_size; ++b) {
+    for (int64_t b = 0; b < num_samples; ++b) {
         const int64_t q_start = cuq_acc[b];
         const int64_t q_end = cuq_acc[b + 1];
         const int64_t k_start = cuk_acc[b];
@@ -56,73 +148,39 @@ void block_sparse_attention_cpu_impl(
             TORCH_CHECK(mask_type > 0,
                         "CPU block sparse attention only supports mask_type > 0; dense and streaming masks are not implemented.");
             const int64_t mask_index = mask_type - 1;
-            TORCH_CHECK(mask_index < blockmask_bool.size(1),
+            TORCH_CHECK(mask_index < base_blockmask.size(1),
                         "mask_type exceeds base_blockmask head count.");
+            TORCH_CHECK(mask_index >= 0, "mask_type must be positive.");
 
-            const int64_t nrow_blocks = blockmask_bool.size(2);
-            const int64_t ncol_blocks = blockmask_bool.size(3);
-
-            for (int64_t qi = q_start; qi < q_end; ++qi) {
-                const int64_t q_relative = qi - q_start;
-                const int64_t row_block = q_relative / block_m;
-                TORCH_CHECK(row_block < nrow_blocks,
-                            "Query row block index exceeds base_blockmask row dimension.");
-
-                std::vector<int64_t> valid_k_idx;
-                std::vector<float> scores;
-
-                for (int64_t ki = k_start; ki < k_end; ++ki) {
-                    const int64_t k_relative = ki - k_start;
-                    const int64_t col_block = k_relative / block_n;
-                    TORCH_CHECK(col_block < ncol_blocks,
-                                "Key column block index exceeds base_blockmask column dimension.");
-
-                    const bool allow = blockmask_acc[b][mask_index][row_block][col_block];
-                    if (!allow) {
-                        continue;
-                    }
-
-                    float score = 0.0f;
-                    for (int64_t d = 0; d < head_dim; ++d) {
-                        score += static_cast<float>(q_acc[qi][h][d]) *
-                                 static_cast<float>(k_acc[ki][h][d]);
-                    }
-                    score *= softmax_scale;
-                    valid_k_idx.push_back(ki);
-                    scores.push_back(score);
-                }
-
-                if (valid_k_idx.empty()) {
-                    for (int64_t d = 0; d < head_dim; ++d) {
-                        out_acc[qi][h][d] = static_cast<scalar_t>(0.0f);
-                    }
-                    continue;
-                }
-
-                const float max_score = *std::max_element(scores.begin(), scores.end());
-                float sum_exp = 0.0f;
-                std::vector<float> probs(scores.size());
-                for (size_t i = 0; i < scores.size(); ++i) {
-                    probs[i] = std::exp(scores[i] - max_score);
-                    sum_exp += probs[i];
-                }
-
-                for (int64_t d = 0; d < head_dim; ++d) {
-                    float acc = 0.0f;
-                    for (size_t i = 0; i < valid_k_idx.size(); ++i) {
-                        const int64_t ki = valid_k_idx[i];
-                        const float weight = probs[i] / sum_exp;
-                        acc += weight * static_cast<float>(v_acc[ki][h][d]);
-                    }
-                    out_acc[qi][h][d] = static_cast<scalar_t>(acc);
-                }
-            }
+            apply_single_head_block_sparse_attention<scalar_t>(
+                q,
+                k,
+                v,
+                base_blockmask,
+                b,
+                h,
+                mask_index,
+                q_start,
+                q_end,
+                k_start,
+                k_end,
+                softmax_scale,
+                out);
         }
     }
 }
 
 }  // namespace
 
+// CPU block sparse attention forward entry.
+// q / k / v: packed Q/K/V tensors with shape [total_tokens, num_heads, head_dim].
+// cu_seqlens_q / cu_seqlens_k: cumulative token counts for each sample in the batch, int32.
+// head_mask_type: per-head mask selector, value > 0 means select mask_type = head_mask_type[i] from base_blockmask.
+// base_blockmask: block mask tensor with shape [batch, num_mask_types, nrow_blocks, ncol_blocks];
+//                the selected mask decides which K-blocks are allowed for each Q-block.
+// max_seqlen_q / max_seqlen_k: padded maximum query/key length of the batch.
+// p_dropout: dropout probability; CPU path only supports 0.0.
+// softmax_scale: attention scaling factor, usually 1 / sqrt(head_dim).
 torch::Tensor cpu_block_sparse_attn_forward(
     const torch::Tensor& q,
     const torch::Tensor& k,
